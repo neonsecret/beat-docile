@@ -35,6 +35,18 @@ failure_analysis.md
 cluster_tightness_report.json
 no_match_novelty_report.json
 
+# Docs — only KNOWLEDGE_BASE.md is published
+README.md
+PRIMER.md
+EVAL_SPEC.md
+PLAN_V2.md
+plan.md
+idea_dllms.md
+runpod/README.md
+runpod/qwen3vl_runbook.md
+tools/region_crop_plan.md
+tools/vlm_finetune_plan.md
+
 # IDE / tooling
 .idea/
 .vscode/
