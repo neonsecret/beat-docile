@@ -1,0 +1,45 @@
+# Secrets / env
+.env
+.env.local
+.env.*
+
+# Build / cache
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ty_cache/
+
+# Data — DO NOT COMMIT (large + may contain sensitive content)
+data/
+references/docile/data/
+references/papers/
+references/docile/
+
+# Model artifacts — too large for git
+models/
+
+# Predictions / experiment outputs
+predictions/
+*.log
+smoke_run*.log
+
+# Internal planning + reports
+.planning/
+memory/
+failure_analysis_traces/
+failure_analysis.md
+cluster_tightness_report.json
+no_match_novelty_report.json
+
+# IDE / tooling
+.idea/
+.vscode/
+.claude/
+.deepeval/
+
+# OS
+.DS_Store
