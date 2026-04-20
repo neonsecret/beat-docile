@@ -41,34 +41,72 @@ These implications shape every architectural choice below.
 
 | System | KILE AP | LIR F1 | Eval set |
 |---|---|---|---|
-| **`v2_ensemble`** (current best) | **46.48%** | **50.77%** | 500 val docs |
-| `v2_preds` (single-model baseline) | 44.61% | 50.89% | 500 val docs |
-| Gap to GraphDoc | -24.77pp | -25.16pp | — |
+| **Qwen3-VL-8B + DocILE LoRA** (current best) | **55.09%** | (not yet measured) | 500 val docs |
+| `v2_ensemble` (prompt-based stack) | 46.48% | 50.77% | 500 val docs |
+| `v2_preds` (single-model prompt baseline) | 44.61% | 50.89% | 500 val docs |
+| Gap to GraphDoc target | -16.16pp KILE | — | — |
 
-### 2.2 Architecture
+The standing best is now a fine-tuned VLM, not a prompt-based stack. Path B (LoRA fine-tune Qwen3-VL-8B-Instruct on DocILE train) cleared the prompt-based ceiling decisively (+8.61pp over the best prompt-based system, +10.48pp over the single-model prompt baseline). The remaining 16.16pp gap to GraphDoc is the open work.
+
+### 2.2 Current best — Qwen3-VL-8B + DocILE LoRA
+
+**Base model:** Qwen3-VL-8B-Instruct (Apache 2.0, Nov 2025). Native bbox grounding capability; DocVQA 97% zero-shot.
+
+**Training recipe:**
+- LoRA r=32, α=64, dropout=0.05; target modules q/k/v/o + gate/up/down on LM layers; vision tower frozen
+- BF16, gradient checkpointing on LM, no quantization
+- Effective batch 16 (per-device 2 × grad_accum 8); LR 2e-4 cosine, 3 epochs (1251 optimizer steps)
+- ~6700 training pages from 5180 DocILE train docs (KILE fields only in this round)
+- Eval slice every 125 steps (last 100 train pages held out for overfitting detection)
+- Single 5090 (32 GB), ~5h 27min wallclock; ~$3.66 RunPod cost
+- Final train_loss 0.184, eval_loss 0.170 — no overfitting (eval tracked below train throughout)
+
+**Inference recipe:**
+- Same base + adapter loaded with `peft`
+- Per-page grounding prompt: "Locate all KILE fields on this page. For each field present, output `{fieldtype: {bbox_2d: [x1, y1, x2, y2 in 0-1000], text}}`. Omit fields not present."
+- Output JSON parsed; `bbox_2d` divided by 1000 → normalized [0,1]
+- Bbox snapped to DocILE OCR word grid via deterministic IoU-based assignment (`_snap_to_words` in `qwen3vl_extract.py`) — guarantees PCC-IoU=1.0 alignment by construction
+- Pace ~20s/doc on 5090 BF16 (~2h 45min for full 500-doc val); ~$1.93 inference cost on RunPod
+
+**Predictions:** `predictions/qwen3vl_lora_val_500.json` (500 docids, 5527 total field predictions, 1.4 MB).
+
+**Per-field details:** precision 0.761, recall 0.718. Both meaningfully higher than `v2_ensemble` (precision 0.56, recall 0.59) — the fine-tuned model both fires more often AND is more accurate when it fires. The fine-tune taught the model the DocILE-specific schema and bbox conventions in a way no prompt could.
+
+**LIR is not yet measured** for this system — the current run trained and infered KILE-only. A second LoRA on LIR examples (or a multi-task fine-tune) is the natural follow-up.
+
+### 2.3 Previous best — `v2_ensemble` (prompt-based stack, kept as fallback / ensemble voice)
 
 **Single extractor (`v2_preds`):** Claude Sonnet via the Anthropic API consuming a per-page row-grouped OCR word listing plus a single cluster-matched few-shot example (image + gold-JSON) drawn from the train split. Output is a JSON dict mapping field type → `{word_ids, text, score}`. Bbox is derived as the union of the snapped bboxes of the selected `word_ids`, so bboxes align to the DocTR snapped grid by construction.
 
-**Ensemble extractor (`v2_ensemble`):** Three runs of `v2_preds` with prompt/temperature variants, merged per-field via the existing `ensemble.py` module:
+**Ensemble extractor (`v2_ensemble`):** Three runs of `v2_preds` with prompt/temperature variants, merged per-field via `ensemble.py`:
 
 | Variant | Configuration |
 |---|---|
 | `v2_t00` | T=1.0, default system prompt |
 | `v2_t03` | T=0.3, default system prompt |
-| `v2_alt` | T=1.0, alternate system prompt with single specific edit |
+| `v2_alt` | T=1.0, alternate system prompt |
 
-Per-field merge takes the prediction with the highest score across the three variants (with `weighted_max` score combination). Recall jumps 0.55 → 0.59 because the variants miss different fields; precision drops 0.62 → 0.56 because the union accumulates more FPs. Net is +1.87pp KILE / -0.12pp LIR.
+Per-field merge takes the prediction with the highest score across the three variants. Recall jumps 0.55 → 0.59; precision drops 0.62 → 0.56. Net +1.87pp KILE over single Sonnet.
 
-### 2.3 What drove the metric from V1 (zero-shot baseline 27.7% KILE) to V2
+### 2.4 What drove the prompt-based stack from V1 (27.7% zero-shot) to v2_ensemble (46.48%)
 
-Two changes account for essentially all of the +17pp jump:
+Two changes account for essentially all of the +18.8pp jump on the prompt path:
 
-1. **Cluster-based few-shot retrieval.** Each DocILE training annotation carries a `cluster_id` (template grouping curated by the dataset authors). 75% of val docs have a cluster with at least one annotated train example. Picking that train example as the few-shot demonstration in the Sonnet prompt is the single largest lever. Built-in metadata, no embedding model required. (CLIP/SigLIP retrieval was tried and underperformed cluster_id.)
+1. **Cluster-based few-shot retrieval.** Each DocILE training annotation carries a `cluster_id` (template grouping curated by the dataset authors). 75% of val docs have a cluster with at least one annotated train example. Picking that train example as the few-shot demonstration in the Sonnet prompt is the single largest lever on the prompt path. Built-in metadata, no embedding model required. (CLIP/SigLIP retrieval was tried and underperformed cluster_id.)
 2. **Row-grouped OCR words in the prompt.** Words are grouped into rows by y-coordinate proximity and emitted as `R{i}(y≈{top:.3f}): {id}:{text}  {id}:{text}` rather than a flat list. Gives the model spatial context without needing the image.
 
-### 2.4 Cost & latency
+Plus the +1.87pp from per-prompt-variant ensembling on top of the single-model baseline.
 
-`v2_ensemble` runs three Anthropic API calls per page. Inference cost is 3× single-model. Each prediction carries an explicit `score` derived from the model's confidence claim plus per-field validation discounts. The output JSON is the standard DocILE prediction format and runs through the official `docile_evaluate` CLI without modification.
+### 2.5 Cost & latency
+
+| System | Per-doc | Full 500-doc | Where |
+|---|---|---|---|
+| `v2_preds` single | ~10s + API rate limits | hours, ~$X Anthropic API | Mac |
+| `v2_ensemble` (3 variants) | 3× v2_preds | hours (sequential), 3× cost | Mac |
+| Qwen3-VL LoRA inference | ~20s | ~2h 45min, ~$1.93 RunPod | RunPod 5090 |
+| Qwen3-VL LoRA training (one-time) | n/a | ~5h 27min, ~$3.66 RunPod | RunPod 5090 |
+
+Output JSON is the standard DocILE prediction format and runs through the official `docile_evaluate` CLI without modification for all three systems.
 
 The codebase ships with status banners on every module ([ACTIVE] / [EXPERIMENTAL] / [RESEARCH-BURIED] / [ARCHIVED]) and a README module map; this document focuses on findings and architecture, not on file-by-file inventory.
 
@@ -544,15 +582,18 @@ Use Sonnet's output as supervision to train a GraphDoc-style GNN (bypassing the 
 
 ## 8. Open Questions
 
-- **Does path B (Qwen3-VL-8B LoRA) clear v2_ensemble?** Pending result. If yes, the prompt-based stack becomes a candidate ensemble voice rather than the primary; if no, the marginal options in §7 become the only remaining levers.
+- **Does path B clear v2_ensemble?** ✅ **ANSWERED.** Qwen3-VL-8B LoRA = 55.09% KILE on 500 val docs (+8.61pp over v2_ensemble, +10.48pp over single-Sonnet baseline). The prompt-based stack is now a candidate ensemble voice rather than the primary.
+- **Does an LIR-fine-tuned variant land similarly?** Open. Current Qwen3-VL run was KILE-only (no LIR predictions). Natural follow-up: second LoRA on LIR examples, or a multi-task fine-tune.
+- **Does an ensemble of (Qwen3-VL LoRA + v2_ensemble) compose?** Open. Two architecturally different systems with different error profiles — per-field merge could plausibly add another +1-3pp KILE on top of 55.09%.
 - **Does VDInstruct release its weights?** If yes, almost certainly preempts every other approach for DocILE specifically.
-- **Is the 25% no-match population recoverable?** §4.6 design is plausible; never end-to-end tested. Estimated +2-3pp dataset-wide.
-- **Is there a span-correction model worth training?** §4.7 / §7.3 design is plausible; never built. Estimated +5-10pp specifically against the multi-word PCC mismatch error.
+- **Is the 25% no-match population recoverable?** §4.6 design is plausible; never end-to-end tested. Estimated +2-3pp dataset-wide on the prompt-based stack; unclear how much it would help the fine-tuned VLM, which doesn't depend on cluster-matched few-shot.
+- **Is there a span-correction model worth training?** §4.7 / §7.3 design is plausible; never built. Estimated +5-10pp specifically against the multi-word PCC mismatch error. May be redundant with path B's better grounding.
 - **Does cross-model ensemble work with a stronger affordable VLM?** Gemini-3-Flash-Preview at thinking_budget=0 is too weak; with thinking is too expensive. Open whether a stronger affordable model changes this.
 - **Does proper conservative AOL (HITL-flag, not score-modify) recover any AP?** §6.11 design is consistent with the architectural lesson; untested.
+- **Path B variants (more epochs / different LoRA rank / different target modules / multi-task with LIR)?** Each is a $2-5 RunPod follow-up that could plausibly add +1-5pp on top of 55.09%.
 
 ---
 
 ## 9. The Single Sentence
 
-**Prompt-based extraction with Claude Sonnet + cluster-based few-shot + row-grouped OCR + per-prompt-variant ensemble achieves 46.48% KILE / 50.77% LIR on the DocILE 500-doc validation set, against GraphDoc's 71.25% / 75.93% target; the remaining gap is structural and requires either a fine-tuned grounding-VLM (path B, in progress), a span-correction model trained on DocILE word grids, or release of VDInstruct's DocILE-trained weights.**
+**A LoRA fine-tune of Qwen3-VL-8B-Instruct on the DocILE training split achieves 55.09% KILE AP on the 500-doc validation set, beating the previous prompt-based best (46.48% KILE via Claude Sonnet + cluster-based few-shot + 3-variant ensemble) by +8.61pp and closing the architectural-mismatch portion of the gap to GraphDoc; the remaining 16.16pp is open work — LIR-specific fine-tuning, cross-architecture ensembling, no-match population coverage, or release of VDInstruct's DocILE-trained weights.**
